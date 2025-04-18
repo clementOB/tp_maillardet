@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------
+# search  —  simplified name/content search with find or locate
+# version: 1.1
+# ------------------------------------------------------------
+
+set -uE -o pipefail
+trap 'rm -f "$tmp_errors"' EXIT
+
+# capture des arguments initiaux pour repérer '--'
+orig_args=("$@")
+original_term=""
+
+orig_args=("$@")
+
+debug=false        # -d  / --debug
+show_errors=false  # -e  / --error
+inside=false       # -i  / --inside
+only_inside=false  # -o  / --only  (nécessite -i)
+use_locate=false   # -l  / --locate
+update_db=false    # -u  / --update
+search_path=""     # -p  / --path <dir>
+declare -a terms   # termes restants (positional)
+tmp_errors="/tmp/search_err.$$"
+
+usage() {
+  cat <<'EOF'
+Usage: search [-h]
+       search [-u]
+       search [-d] [-e] [-l] [-i [-o]] STRING [STRING…]
+       search [-d] [-e] [-l] [-i [-o]] STRING [PATH] [STRING…]
+       search [-d] [-e] [-l] [-i [-o]] [-p PATH] STRING [STRING…]
+
+Options:
+  -d, --debug   Show debug messages (set -x)
+  -e, --error   Show error messages during search
+  -h, --help    Show this help and exit
+  -i, --inside  Search inside file contents
+  -o, --only    (with -i) Search exclusively inside file contents
+  -l, --locate  Use locate instead of find
+  -p, --path    Force search directory (default: current)
+  -u, --update  Update locate DB (via sudo updatedb)
+
+Note:
+  Use '--' before terms to prevent auto-detection of a term as a search path.
+EOF
+}
+
+# parse options
+ARGS=$(getopt -o dehilop:u -l debug,error,help,inside,locate,only,path:,update -- "${orig_args[@]}") || { usage; exit 1; }
+eval set -- "$ARGS"
+while true; do
+  case "$1" in
+    -d|--debug)   debug=true;       shift ;;  
+    -e|--error)   show_errors=true; shift ;;  
+    -h|--help)    usage;            exit 0 ;; 
+    -i|--inside)  inside=true;      shift ;;  
+    -o|--only)    only_inside=true; shift ;;  
+    -l|--locate)  use_locate=true;  shift ;;  
+    -p|--path)    search_path="$2"; shift 2 ;;  
+    -u|--update)  update_db=true;   shift ;;  
+    --)           shift;            break ;; 
+    *) break ;;  
+  esac
+done
+[[ "$debug" == true ]] && set -x
+
+# validate -o usage
+if [[ "$only_inside" == true && "$inside" == false ]]; then
+  echo "Error: -o/--only requires -i/--inside" >&2
+  exit 1
+fi
+
+# no args and no update => help
+if [[ "$#" -eq 0 && "$update_db" == false ]]; then
+  usage >&2; exit 1
+fi
+terms=("$@")
+
+# handle update
+if [[ "$update_db" == true ]]; then
+  sudo updatedb
+  exit $?
+fi
+
+# detect -- to disable auto path
+nodetect=false
+for a in "${orig_args[@]}"; do
+  [[ "$a" == "--" ]] && nodetect=true && break
+done
+
+# auto-detect search_path from terms
+if [[ -z "$search_path" && "$nodetect" == false ]]; then
+  for idx in "${!terms[@]}"; do
+    term="${terms[$idx]}"
+    if [[ -d "$term" ]]; then
+      search_path="$term"
+      unset 'terms[$idx]'
+      break
+    fi
+  done
+fi
+search_path="${search_path:-$PWD}"
+# ensure absolute path
+[[ "$search_path" != /* ]] && search_path="$PWD/$search_path"
+# reassemble terms
+tmp=()
+for t in "${terms[@]}"; do tmp+=("$t"); done
+terms=("${tmp[@]}")
+
+# mode find (default)
+if ! $use_locate && ! $inside; then
+  expr=()
+  for t in "${terms[@]}"; do expr+=( -iname "*${t}*" -a ); done
+  unset 'expr[${#expr[@]}-1]'
+  if $show_errors; then
+    find -L "$search_path" \( "${expr[@]}" \) -print | sed "s|^$search_path|.|"
+  else
+    find -L "$search_path" \( "${expr[@]}" \) -print 2> "$tmp_errors" | sed "s|^$search_path|.|"
+    [[ -s "$tmp_errors" ]] && echo "Warning: some error reported during find. Use -e to show them"
+  fi
+  exit
+fi
+
+# mode locate
+if $use_locate && ! $inside; then
+  # build locate command: errors go to stderr if -e given
+  if $show_errors; then
+    mapfile -t loc_list < <(locate -i "${terms[0]}")
+  else
+    mapfile -t loc_list < <(locate -i "${terms[0]}" 2>/dev/null)
+  fi
+  for t in "${terms[@]:1}"; do
+    mapfile -t loc_list < <(printf "%s\n" "${loc_list[@]}" | grep -i "${t}")
+  done
+  for filepath in "${loc_list[@]}"; do
+    [[ "$filepath" == "$search_path"/* ]] && echo "$filepath"
+  done
+  exit
+fi
+
+# mode inside
+if $inside; then
+  if $only_inside; then
+    grep -I -R -n "${terms[@]}" "$search_path"
+  else
+    expr=()
+    for t in "${terms[@]}"; do expr+=( -iname "*${t}*" -a ); done
+    unset 'expr[${#expr[@]}-1]'
+    mapfile -t files < <(find -L "$search_path" -type f \( "${expr[@]}" \) -print)
+    for f in "${files[@]}"; do
+      ok=true
+      for t in "${terms[@]}"; do
+        grep -Iq "$t" "$f" || ok=false
+      done
+      $ok && echo "$f"
+    done
+  fi
+  exit
+fi
